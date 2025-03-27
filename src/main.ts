@@ -1,11 +1,9 @@
 import express, { Request, Response } from 'express';
-import dotenv from 'dotenv';
 import { InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
 import { getPrompt } from './prompt.js';
 import { bedrockClient } from './bedrockClient.js';
 import { octokit } from './octokit.js';
-
-dotenv.config();
+import { config } from './config.js';
 
 interface GitHubPRPayload {
   action: string;
@@ -32,8 +30,24 @@ interface GitHubFile {
   patch?: string; // Contains the diff of changes in the file
 }
 
+interface AIFeedback {
+    commentNeeded: boolean;
+    lineComments?: Array<{
+      lineNumber: number;
+      comment: string;
+    }>;
+    summary?: string;
+    detailedFeedback?: string;
+    codeSnippets?: {
+      before: string;
+      after: string;
+    }[];
+    message?: string;
+  }
+  
+
 const app = express();
-const port = process.env.PORT || 3000;
+const port = config.PORT;
 
 app.use(express.json());
 
@@ -68,58 +82,108 @@ async function processPR(pr: GitHubPullRequest): Promise<void> {
     console.log(`- ${file.filename}`);
 
     if (file.patch) {
-      const aiFeedback = await analyzeCodeWithAI(file.filename, file.patch);
-      
-      if (aiFeedback) {
-        await postPRComment(pr, aiFeedback);
+        const aiFeedback = await analyzeCodeWithAI(file.filename, file.patch);
+
+        if (aiFeedback) {
+            // Check if feedback is needed and if so, post it
+            if (aiFeedback.commentNeeded) {
+                // Check for line-specific comments
+                if (aiFeedback.lineComments) {
+                    // Post line comments to GitHub with file path, code snippet, and AI-generated comment
+                    aiFeedback.lineComments.forEach(async (element) => {
+                        // Create a snippet of the code to highlight around the changed line (3 lines of context)
+                        const startLine = Math.max(element.lineNumber - 1, 0); // Ensure we don't go negative
+                        const endLine = element.lineNumber + 2; // 3-line context (before, changed, after)
+                        
+                        const codeSnippet = `\`\`\`diff\n` + 
+                            `@@ -${startLine + 1},${endLine - startLine + 1} @@\n` + 
+                            `${element.comment}\n` +
+                            `\`\`\``;
+        
+                        const comment = `**File Path:** ${pr.base.repo.name}/${file.filename}\n\n` + 
+                            `**Code Changes:**\n${codeSnippet}\n\n` + 
+                            `**AI Comment:**\n${element.comment}`;
+        
+                        // Post comment to GitHub
+                        await postPRComment(pr, comment);
+                    });
+                } else {
+                    // If no line-specific comments, post general feedback
+                    const comment = `${aiFeedback.summary || ''}\n\n${aiFeedback.detailedFeedback || ''}`;
+                    await postPRComment(pr, comment);
+                }
+            } else {
+                console.log(aiFeedback.message || 'No feedback required');
+            }
+        }
+        
+    }
+  }
+}
+
+async function analyzeCodeWithAI(filename: string, codeDiff: string): Promise<AIFeedback | null> {
+    try {
+      const modelId = config.BEDROCK_MODEL_ID;
+  
+      const prompt = `Human: ${getPrompt(filename, codeDiff)} Assistant:`;
+  
+      const command = new InvokeModelCommand({
+        modelId,
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify({
+          prompt,
+          max_tokens_to_sample: 1024, // Ensures detailed response
+          temperature: 0.7, // Balances creativity and accuracy
+          top_p: 0.9, // Controls randomness
+        }),
+      });
+  
+      const response = await bedrockClient.send(command);
+  
+      if (response.body) {
+        const responseText = await response.body.transformToString();
+        
+        try {
+          const parsedResponse: AIFeedback = JSON.parse(responseText);
+  
+          if (parsedResponse.commentNeeded === false) {
+            return null; // No comment needed
+          }
+  
+          // Return the parsed response with line-specific comments
+          return parsedResponse;
+        } catch (error) {
+          console.error('Error parsing AI response:', error);
+          return {
+            commentNeeded: true,
+            message: 'Error parsing AI response, fallback to raw response.',
+          };
+        }
       }
+    } catch (error) {
+      console.error('Error calling AWS Bedrock:', error);
     }
+  
+    return null; // Return null if something goes wrong
   }
-}
-
-// Function to analyze code using AWS Bedrock
-async function analyzeCodeWithAI(filename: string, codeDiff: string): Promise<string | null> {
-  try {
-    const modelId = process.env.BEDROCK_MODEL_ID || 'anthropic.claude-v2'; // Set your Bedrock model
-
-    const fi = filename;
-
-    const prompt = getPrompt(filename, codeDiff)
-
-    const command = new InvokeModelCommand({
-      modelId,
-      contentType: 'application/json',
-      accept: 'application/json',
-      body: JSON.stringify({
-        prompt,
-        max_tokens: 1024, // Ensures detailed response
-        temperature: 0.7, // Balances creativity and accuracy
-        top_p: 0.9, // Controls randomness
-      }),
-    });
-
-    const response = await bedrockClient.send(command);
-
-    if (response.body) {
-      const responseText = response.body.transformToString();
-      return responseText;
-    }
-  } catch (error) {
-    console.error('Error calling AWS Bedrock:', error);
-  }
-
-  return null;
-}
+  
 
 // Function to post AI-generated feedback as a comment in the PR
 async function postPRComment(pr: GitHubPullRequest, comment: string): Promise<void> {
-  await octokit.rest.issues.createComment({
-    owner: pr.base.repo.owner.login,
-    repo: pr.base.repo.name,
-    issue_number: pr.number,
-    body: `🤖 AI Code Review Feedback:\n\n${comment}`,
-  });
-}
+    // Clean up the comment to extract only the meaningful text
+    const cleanedComment = comment && comment.trim().replace(/\\n/g, '\n'); // Handle newlines properly
+    
+    const formattedComment = `🤖 AI Code Review Feedback:\n\n${cleanedComment}`;
+  
+    // Post the comment on the PR
+    await octokit.rest.issues.createComment({
+      owner: pr.base.repo.owner.login,
+      repo: pr.base.repo.name,
+      issue_number: pr.number,
+      body: formattedComment,
+    });
+  }
 
 // Start the server
 app.listen(port, () => {

@@ -1,5 +1,6 @@
 import { Octokit } from "@octokit/rest";
+import { config } from "./config.js";
 
 export const octokit = new Octokit({
-  auth: process.env.GITHUB_TOKEN,
+  auth: config.GITHUB_TOKEN,
 });
