@@ -1,9 +1,10 @@
 import express, { Request, Response } from 'express';
 import { InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
-import { getPrompt } from './prompt.js';
+import { getPrompt } from './prompts/prompt.js';
 import { bedrockClient } from './bedrockClient.js';
 import { octokit } from './octokit.js';
 import { config } from './config.js';
+import { getFallbackPrompt } from './prompts/fallbackPrompt.js';
 
 interface GitHubPRPayload {
   action: string;
@@ -77,12 +78,17 @@ async function processPR(pr: GitHubPullRequest): Promise<void> {
     pull_number: pr.number,
   });
 
+  let hasCommented = false;
+  let allSummaries: string[] = [];
+
   console.log(`Files changed in PR #${pr.number}:`);
   for (const file of filesResponse.data) {
     console.log(`- ${file.filename}`);
 
     if (file.patch) {
         const aiFeedback = await analyzeCodeWithAI(file.filename, file.patch);
+
+        allSummaries.push(aiFeedback.summary)
 
         if (aiFeedback) {
             // Check if feedback is needed and if so, post it
@@ -106,6 +112,7 @@ async function processPR(pr: GitHubPullRequest): Promise<void> {
         
                         // Post comment to GitHub
                         await postPRComment(pr, comment);
+                        hasCommented = true;
                     });
                 } else {
                     // If no line-specific comments, post general feedback
@@ -119,6 +126,46 @@ async function processPR(pr: GitHubPullRequest): Promise<void> {
         
     }
   }
+
+  if (!hasCommented && allSummaries){
+    const overallSummaryPrompt = getFallbackPrompt(allSummaries);
+
+    // Send the overall summary prompt to the AI model
+    const prOverviewFeedback = await analyzeCodeWithAI('PR Overview', overallSummaryPrompt);
+
+    if (prOverviewFeedback) {
+        // Format the AI's response into a structured comment
+        const overviewComment = `
+                **General Overview:**
+
+                ${prOverviewFeedback.summary || 'No significant changes detected.'}
+
+                ---
+
+                **Detailed Feedback:**
+
+                ${prOverviewFeedback.detailedFeedback || 'No further details provided.'}
+
+                `;
+
+        await postPRComment(pr, overviewComment);
+    } else {
+        // In case no summary is generated, post a default message
+        const defaultComment = `
+                **General Overview:**
+
+                No significant changes detected in the pull request.
+
+                ---
+
+                **Detailed Feedback:**
+
+                There were no major issues or feedback found in the PR.
+                `;
+
+        await postPRComment(pr, defaultComment);
+    }
+}
 }
 
 async function analyzeCodeWithAI(filename: string, codeDiff: string): Promise<AIFeedback | null> {
