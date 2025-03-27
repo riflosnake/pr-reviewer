@@ -1,9 +1,9 @@
 import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import { InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
-import { getPrompt } from './prompt'
-import { bedrockClient } from './bedrockClient';
-import { octokit } from './octokit';
+import { getPrompt } from './prompt.js';
+import { bedrockClient } from './bedrockClient.js';
+import { octokit } from './octokit.js';
 
 dotenv.config();
 
